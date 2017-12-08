@@ -2,13 +2,20 @@ module Handler (handler) where
 
 import Prelude
 
+import Control.Monad.Aff (Aff, runAff_)
+import Control.Monad.Aff.Class (liftAff)
+import Control.Monad.Eff (Eff)
 import Control.Monad.Eff.Exception (Error, error)
-import Control.Monad.Except (runExcept)
+import Control.Monad.Eff.Uncurried (EffFn3, mkEffFn3)
+import Control.Monad.Except (except, runExceptT)
+import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
-import Data.Foreign (Foreign, F, toForeign)
+import Data.Foreign (Foreign, MultipleErrors, toForeign)
 import Data.Foreign.NullOrUndefined (undefined)
-import Data.Function.Uncurried (Fn2, Fn3, mkFn3, runFn2)
-import Simple.JSON (read, write)
+import Data.Function.Uncurried (Fn2, runFn2)
+import Milkis (defaultFetchOptions, fetch, text)
+import Node.HTTP (HTTP)
+import Simple.JSON (readJSON, write)
 
 --------------------------------------------------------------------------------
 -- | Type alias for an uncurried callback function from Lambda.
@@ -25,26 +32,40 @@ handleResult cb (Left  err) = cb (toForeign err) (write undefined)
 handleResult cb (Right msg) = cb (write undefined) (toForeign msg)
 
 --------------------------------------------------------------------------------
--- | Expected record fields for the event passed to the Lambda function.
-type Event =
-  { payload ::
-       { message :: String }
-  }
+type HttpBinRes = { origin :: String }
 
+getIpAddr :: ∀ e. Aff (http :: HTTP | e) (Either MultipleErrors HttpBinRes)
+getIpAddr = runExceptT $ do
+  res <- liftAff $ text =<< fetch "https://httpbin.org/ip" defaultFetchOptions
+  except $ readJSON res
+
+--------------------------------------------------------------------------------
 -- | PureScript implementation of the Lambda handler logic.
-handlerImpl :: Foreign -> Foreign -> LambdaCallbackFn -> Unit
-handlerImpl event _ callback =
+handlerImpl
+  :: ∀ e
+   . Foreign
+  -> Foreign
+  -> LambdaCallbackFn
+  -> Eff (http :: HTTP | e) Unit
+handlerImpl _event _ callback =
   let cb = runFn2 callback
-      cbHandler = handleResult cb
-      decoded = map _.payload.message $ runExcept (read event :: F Event)
+      cbHandler = pure <<< handleResult cb
 
-  -- v-- A one-liner for the case statement
-  -- cbHandler $ lmap (error <<< show) decoded
+  in flip runAff_ getIpAddr $ \res ->
 
-  in case decoded of
-    Left  err -> cbHandler $ Left (error $ show err)
-    Right msg -> cbHandler $ Right msg
+    -- v-- A one-liner for the case statement
+    -- cbHandler $ lmap (error <<< show) decoded
+
+    case res of
+      Left  err -> cbHandler $ Left (error $ show err)
+      Right msg -> cbHandler $ Right msg
 
 -- | Expose the PureScript handler in a way that Lambda can consume.
-handler :: Fn3 Foreign Foreign LambdaCallbackFn Unit
-handler = mkFn3 handlerImpl
+handler
+  :: ∀ e.
+    EffFn3
+      (http :: HTTP | e)
+      Foreign
+      Foreign
+      LambdaCallbackFn Unit
+handler = mkEffFn3 handlerImpl
